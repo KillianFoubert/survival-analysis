@@ -1,0 +1,615 @@
+---
+title: "Survival Analysis in Oncology"
+subtitle: "Advanced Lung Cancer — NCCTG Cohort (n = 228)"
+author: "Killian Foubert, Ph.D."
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+This report presents a survival analysis on advanced lung cancer data from the **North Central Cancer Treatment Group (NCCTG)** cohort. Data were collected in the late 1980s. Although dated, this dataset remains a reference for teaching and demonstrating survival analysis methods in oncology. The dataset comprises 228 patients and is freely available in the R `survival` package.
+
+**Objectives:**
+
+- Describe patient characteristics by sex
+- Estimate overall and stratified survival (Kaplan-Meier)
+- Identify independent prognostic factors (Cox model)
+- Verify model assumptions (Schoenfeld residuals)
+
+# Packages and data
+
+## Loading packages
+
+```{r packages}
+library(survival)    # survival models (Surv, survfit, coxph)
+library(survminer)   # Kaplan-Meier visualisation (ggsurvplot)
+library(broom)       # model results extraction (tidy)
+library(gtsummary)   # descriptive and regression tables
+library(dplyr)       # data manipulation
+library(tidyr)       # data reshaping
+library(ggplot2)     # visualisation
+```
+
+## Data preparation
+
+```{r data-prep}
+data(lung)
+
+lung <- lung %>%
+  mutate(
+    # Recode status: 1 = death, 0 = censored
+    status_bin = ifelse(status == 2, 1, 0),
+    
+    # Readable labels
+    sex_label = factor(sex, levels = c(1, 2), labels = c("Male", "Female")),
+    
+    ecog_label = factor(
+      ph.ecog,
+      levels = 0:3,
+      labels = c(
+        "ECOG 0 — Asymptomatic",
+        "ECOG 1 — Sympt. ambulatory",
+        "ECOG 2 — In bed <50%",
+        "ECOG 3 — In bed >50%"
+      )
+    ),
+    
+    age_group = cut(
+      age,
+      breaks = c(0, 60, 70, Inf),
+      labels = c("<60 years", "60–70 years", ">70 years")
+    )
+  ) %>%
+  filter(!is.na(ph.ecog))
+
+# Survival object (reused throughout)
+surv_obj <- Surv(time = lung$time, event = lung$status_bin)
+```
+
+The dataset contains **`r nrow(lung)` patients** after excluding missing values on the ECOG score.
+
+**The ECOG score** (*Eastern Cooperative Oncology Group Performance Status*) is a 0-to-5 scale used in oncology to assess a patient's functional status. It is systematically measured before and during treatment as it directly influences therapeutic decisions and is a major prognostic factor:
+
+<table style="border-collapse: collapse; margin-left: 0;">
+<thead><tr style="border-bottom: 2px solid #ccc;">
+<th style="text-align: center; padding: 6px 20px;">Score</th>
+<th style="text-align: left; padding: 6px 10px;">Meaning</th>
+</tr></thead>
+<tbody>
+<tr><td style="text-align: center; padding: 4px 20px;">0</td><td style="padding: 4px 10px;">Asymptomatic patient, normal activity</td></tr>
+<tr style="background-color: #f9f9f9;"><td style="text-align: center; padding: 4px 20px;">1</td><td style="padding: 4px 10px;">Symptomatic but ambulatory, capable of light activity</td></tr>
+<tr><td style="text-align: center; padding: 4px 20px;">2</td><td style="padding: 4px 10px;">In bed less than 50% of the day, capable of self-care but unable to work</td></tr>
+<tr style="background-color: #f9f9f9;"><td style="text-align: center; padding: 4px 20px;">3</td><td style="padding: 4px 10px;">In bed more than 50% of the day, limited self-care capacity</td></tr>
+<tr><td style="text-align: center; padding: 4px 20px;">4</td><td style="padding: 4px 10px;">Completely bedridden, no self-care capacity</td></tr>
+<tr style="background-color: #f9f9f9;"><td style="text-align: center; padding: 4px 20px;">5</td><td style="padding: 4px 10px;">Deceased</td></tr>
+</tbody></table>
+
+In our dataset, only scores 0 to 3 are represented.
+
+*Scale available at [ecog-acrin.org](https://ecog-acrin.org/resources/ecog-performance-status/).*
+
+# Descriptive analysis
+
+```{r table1}
+# Prepare data for Table 1
+lung_t1 <- lung %>%
+  mutate(status_label = factor(status_bin, levels = c(0, 1), labels = c("No", "Yes")))
+
+# Compute p-values manually
+p_age   <- wilcox.test(age ~ sex_label, data = lung_t1)$p.value
+p_ecog  <- fisher.test(lung_t1$ecog_label, lung_t1$sex_label, simulate.p.value = TRUE)$p.value
+p_wt    <- wilcox.test(wt.loss ~ sex_label, data = lung_t1)$p.value
+p_death <- chisq.test(lung_t1$status_label, lung_t1$sex_label)$p.value
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Table 1. Patient characteristics by sex (n = 227)
+</div>
+
+```{r table1-display, echo=FALSE}
+lung_t1 %>%
+  select(age, sex_label, ecog_label, wt.loss, status_label) %>%
+  tbl_summary(
+    by = sex_label,
+    statistic = list(
+      all_continuous()  ~ "{mean} (SD = {sd})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    label = list(
+      age          ~ "Age",
+      ecog_label   ~ "ECOG score",
+      wt.loss      ~ "Weight loss (lbs, last 6 months)",
+      status_label ~ "Death"
+    ),
+    missing_text = "Missing data"
+  ) %>%
+  add_overall() %>%
+  bold_labels() %>%
+  modify_header(label ~ "**Variable**") %>%
+  modify_footnote(everything() ~ NA) %>%
+  modify_table_styling(
+    columns = label,
+    footnote = "Mean (SD = standard deviation); n (%)"
+  )
+```
+
+<br>
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Table 2. Male vs Female comparison tests (H₀: no difference between sexes)
+</div>
+
+```{r pvalues-table2, echo=FALSE, results='asis'}
+interpret <- function(p, var_name) {
+  if (p < 0.05) {
+    paste0("Significant difference between males and females for ", var_name)
+  } else {
+    paste0("No significant difference between males and females for ", var_name)
+  }
+}
+
+fmt_p <- function(p) {
+  if (p < 0.001) {
+    "<&nbsp;0.001"
+  } else {
+    formatC(round(p, 3), format = "f", digits = 3)
+  }
+}
+
+tab2 <- data.frame(
+  Variable = c("Age", "ECOG score", "Weight loss", "Death"),
+  Test = c("Wilcoxon (rank)", "Fisher exact", "Wilcoxon (rank)", "Chi-squared"),
+  p_value = c(fmt_p(p_age), fmt_p(p_ecog), fmt_p(p_wt), fmt_p(p_death)),
+  Interpretation = c(
+    interpret(p_age, "age"),
+    interpret(p_ecog, "ECOG score"),
+    interpret(p_wt, "weight loss"),
+    interpret(p_death, "death rate")
+  ),
+  stringsAsFactors = FALSE
+)
+
+cat('<table style="border-collapse: collapse; width: 100%; font-size: 0.95em;">\n')
+cat('<thead><tr style="border-bottom: 2px solid #ccc;">\n')
+cat('<th style="text-align:left; padding: 6px 10px;">Variable</th>\n')
+cat('<th style="text-align:left; padding: 6px 10px;">Test</th>\n')
+cat('<th style="text-align:right; padding: 6px 10px; white-space: nowrap;">p-value</th>\n')
+cat('<th style="text-align:left; padding: 6px 10px;">Interpretation</th>\n')
+cat('</tr></thead>\n<tbody>\n')
+
+for (i in seq_len(nrow(tab2))) {
+  bg <- if (i %% 2 == 0) ' style="background-color: #f9f9f9;"' else ''
+  cat(paste0('<tr', bg, '>\n'))
+  cat(paste0('<td style="padding: 5px 10px;">', tab2$Variable[i], '</td>\n'))
+  cat(paste0('<td style="padding: 5px 10px;">', tab2$Test[i], '</td>\n'))
+  cat(paste0('<td style="padding: 5px 10px; text-align: right; white-space: nowrap;">', tab2$p_value[i], '</td>\n'))
+  cat(paste0('<td style="padding: 5px 10px;">', tab2$Interpretation[i], '</td>\n'))
+  cat('</tr>\n')
+}
+
+cat('</tbody></table>\n')
+```
+
+<br>
+
+Methodological note: the choice of statistical test is adapted to each variable.
+
+- The Wilcoxon test is used for continuous variables (no normality assumption required, making it more robust, especially for weight loss which has missing values and a likely asymmetric distribution).
+- Fisher's exact test is preferred over chi-squared for the ECOG score due to very small cell counts (ECOG 3, n = 1).
+- The chi-squared test is used for death, as cell counts are sufficient.
+
+# Kaplan-Meier analysis
+
+The Kaplan-Meier estimator is a non-parametric method for estimating the survival function from censored data. It makes no assumption about the shape of the survival time distribution: the curve is estimated directly from the observed data. In oncology, survival data almost always contain "censored" observations: patients for whom the exact date of the event of interest (here, death) is unknown. This is the case, for example, for a patient still alive at the end of the study, or lost to follow-up. For these patients, we only know that they survived at least until a certain date, without knowing what happened afterwards. The strength of the Kaplan-Meier estimator is precisely its ability to use this partial information rather than excluding it from the analysis.
+
+The resulting Kaplan-Meier curve is a step function: it remains stable between events and drops one step at each observed death. The small vertical marks on the curve ("|") represent censored patients. The median survival corresponds to the time at which the curve crosses the 50% threshold. In other words, the time after which half of the patients have died.
+
+To compare survival curves between two or more groups (e.g. males vs females), the log-rank test is used. This test evaluates whether survival curves differ significantly between groups under the null hypothesis that survival is identical across all groups.
+
+## Overall survival
+
+```{r km-global-code}
+km_global <- survfit(surv_obj ~ 1, data = lung)
+
+p_km_global <- ggsurvplot(
+  km_global,
+  data = lung,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  risk.table.col = "strata",
+  surv.median.line = "hv",
+  censor.shape = "|",
+  censor.size = 6,
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend = "none",
+  ggtheme = theme_minimal(base_size = 13),
+  palette = "#2E75B6",
+  risk.table.height = 0.25,
+  caption = "Vertical bars ( | ) represent censored patients."
+)
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Figure 1. Overall survival curve (Kaplan-Meier) — Lung cancer, NCCTG cohort
+</div>
+
+```{r km-global-plot, echo=FALSE}
+p_km_global
+```
+
+**Overall median survival** is **`r summary(km_global)$table["median"]` days** (95% CI: `r summary(km_global)$table["0.95LCL"]`–`r summary(km_global)$table["0.95UCL"]`).
+
+**Reading the figure:** the blue curve represents the estimated survival probability over time for all 227 patients. The grey shaded area around the curve corresponds to the 95% confidence interval. The dashed horizontal and vertical lines indicate the median survival: the point where 50% of patients are still alive, reached here at 310 days. We observe a rapid decline in survival during the first 250 days, followed by a gradual slowdown. Beyond 750 days, the curve stabilises around 10%, meaning approximately one in ten patients survives beyond two years.
+
+**Reading the "Number at risk" table:** this table shows the number of patients still being followed (neither deceased nor censored) at each time point. At the start of the study, 227 patients are at risk. At 250 days, 115 remain, the others have either died (the curve has dropped) or been censored (the vertical bars on the curve). At 1,000 days, only 2 patients are still being followed, which explains the instability of the curve and the widening of the confidence interval at the end of follow-up.
+
+## Survival by sex
+
+```{r km-sex-code}
+km_sex <- survfit(surv_obj ~ sex_label, data = lung)
+
+p_km_sex <- ggsurvplot(
+  km_sex,
+  data = lung,
+  pval = TRUE,
+  pval.method = TRUE,
+  conf.int = TRUE,
+  risk.table = TRUE,
+  censor.shape = "|",
+  censor.size = 6,
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend.title = "Sex",
+  legend.labs = c("Male", "Female"),
+  ggtheme = theme_minimal(base_size = 13),
+  palette = c("#2E75B6", "#D9534F"),
+  risk.table.height = 0.25,
+  caption = "Vertical bars ( | ) represent censored patients."
+)
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Figure 2. Survival curves by sex (Kaplan-Meier) with log-rank test
+</div>
+
+```{r km-sex-plot, echo=FALSE}
+p_km_sex
+```
+
+```{r logrank-sex}
+logrank_sex <- survdiff(surv_obj ~ sex_label, data = lung)
+p_sex <- 1 - pchisq(logrank_sex$chisq, df = 1)
+```
+
+The log-rank test shows a **`r ifelse(p_sex < 0.05, "significant", "non-significant")`** difference between males and females (p = `r format.pval(p_sex, digits = 3)`). Females present a longer survival than males.
+
+**Reading the figure:** the two curves represent estimated survival for males (blue, n = 137) and females (red, n = 90). The shaded areas around the curves correspond to the 95% confidence intervals. The female curve remains consistently above the male curve throughout follow-up, indicating a higher survival probability at each time point.
+
+The gap between the two curves widens progressively from around 250 days. At 500 days, estimated female survival is approximately 40% versus approximately 20% for males. Females thus have roughly twice the chance of still being alive at that point.
+
+The log-rank test (p = 0.0016) confirms that this difference is not due to chance. Under the null hypothesis that survival is identical for males and females, the probability of observing a gap as large or larger than the one measured here is only 0.16%. We therefore reject the null hypothesis: there is a significant survival difference between sexes.
+
+**Reading the "Number at risk" table:** at baseline, 137 males and 90 females are being followed. At 500 days, 20 males and 21 females remain. Although males were more numerous at baseline, they are now at equal numbers with females, reflecting the excess male mortality. At 1,000 days, only 2 males and no females are still being followed (the remaining females having been censored before that date).
+
+**Limitation:** this bivariate analysis does not account for potential confounding factors (age, ECOG score, etc.) that could partly explain the observed difference. The multivariate analysis (Cox model, Section 5) will verify whether the sex effect persists after adjustment.
+
+## Survival by ECOG score
+
+Le score ECOG (*Eastern Cooperative Oncology Group*) measures the patient's functional status. A higher score indicates a more degraded health status.
+
+```{r km-ecog-code}
+km_ecog <- survfit(surv_obj ~ ecog_label, data = lung)
+
+p_km_ecog <- ggsurvplot(
+  km_ecog,
+  data = lung,
+  pval = TRUE,
+  pval.method = TRUE,
+  conf.int = FALSE,
+  risk.table = TRUE,
+  censor.shape = "|",
+  censor.size = 6,
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend.title = "ECOG score",
+  legend.labs = c("ECOG 0", "ECOG 1", "ECOG 2", "ECOG 3"),
+  ggtheme = theme_minimal(base_size = 13),
+  palette = c("#5CB85C", "#F0AD4E", "#D9534F", "#8B0000"),
+  risk.table.height = 0.30,
+  caption = "Vertical bars ( | ) represent censored patients."
+)
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Figure 3. Survival curves by ECOG score (Kaplan-Meier) with log-rank test
+</div>
+
+```{r km-ecog-plot, echo=FALSE}
+p_km_ecog
+```
+
+The **ECOG score is strongly associated with survival**: patients with a high score (degraded functional status) have markedly reduced survival.
+
+**Reading the figure:** the four curves represent estimated survival for each ECOG level. We observe a clear dose-response gradient: the higher the ECOG score (degraded functional status), the shorter the survival. The curves are well separated and do not cross, which is a sign of proportional hazards. We will verify this assumption in Section 6.
+
+Asymptomatic patients (ECOG 0, green) have the best survival: approximately 60% are still alive at 250 days, and median survival exceeds 400 days. Symptomatic but ambulatory patients (ECOG 1, orange) follow an intermediate profile with a median survival of approximately 300 days. Patients in bed less than 50% of the time (ECOG 2, red) have markedly reduced survival, with a median survival of approximately 200 days. Finally, the single ECOG 3 patient (dark red) died before 250 days, but this single-patient sample size precludes any statistical conclusion for this group.
+The log-rank test (p < 0.0001) confirms that survival differences between ECOG groups are highly significant.
+
+**Reading the "Number at risk" table:** the difference in dynamics between groups is clearly visible. At 250 days, 68% of ECOG 0 patients are still being followed (43/63), versus 49% of ECOG 1 (55/113) and only 34% of ECOG 2 (17/50). The ECOG 3 patient has disappeared from follow-up by 250 days. This differential attrition directly reflects the mortality differences between groups.
+
+**Clinical implication:** the ECOG score, measured by a simple clinical examination without any equipment, proves to be a powerful predictor of survival. This is why it is systematically used in oncology practice to guide therapeutic decisions: a patient with a high ECOG score will on average be less likely to tolerate aggressive treatment.
+
+## Survival by age group
+
+```{r km-age-code}
+km_age <- survfit(surv_obj ~ age_group, data = lung)
+
+p_km_age <- ggsurvplot(
+  km_age,
+  data = lung,
+  pval = TRUE,
+  pval.method = TRUE,
+  conf.int = FALSE,
+  risk.table = TRUE,
+  censor.shape = "|",
+  censor.size = 6,
+  xlab = "Time (days)",
+  ylab = "Survival probability",
+  legend.title = "Age group",
+  legend.labs = c("<60 years", "60–70 years", ">70 years"),
+  ggtheme = theme_minimal(base_size = 13),
+  palette = c("#2E75B6", "#F0AD4E", "#D9534F"),
+  risk.table.height = 0.25,
+  caption = "Vertical bars ( | ) represent censored patients."
+)
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Figure 4. Survival curves by age group (Kaplan-Meier) with log-rank test
+</div>
+
+```{r km-age-plot, echo=FALSE}
+p_km_age
+```
+
+**Reading the figure:** the three curves represent estimated survival for patients under 60 (blue, n = 93), 60 to 70 (orange, n = 88) and over 70 (red, n = 46). Unlike sex and ECOG score, the survival curves by age group are relatively close and cross each other several times during follow-up.
+
+The log-rank test yields a p-value of 0.075, which is above the 5% threshold. **We therefore cannot conclude that there is a significant survival difference between age groups in this cohort.** In other words, based on this bivariate analysis, age alone does not appear to be a major prognostic factor in advanced lung cancer.
+
+Several hypotheses may explain this: age is probably correlated with ECOG score (elderly patients with a poor ECOG may never enter the cohort as they are ineligible for treatment), the >70 group has a smaller sample size (n = 46) which reduces statistical power, and the effect of age could be masked by other factors such as sex or ECOG score.
+
+**Reading the "Number at risk" table:** the three groups lose patients at a similar rate. At 500 days, 18, 18 and 5 patients remain in the three groups respectively. With the >70 group already small at baseline, the curve is less stable towards the end of follow-up.
+
+**Note:** the non-significance of age in bivariate analysis does not mean that age has no effect. The multivariate Cox model will test the effect of age after adjustment for sex and ECOG score.
+
+# Cox model
+
+The Kaplan-Meier curves in the previous section allow us to visualise survival differences between groups and test their significance via the log-rank test. However, this approach has two limitations. First, it does not quantify the magnitude of the effect; second, it can only analyse one variable at a time without accounting for others.
+
+The **Cox model** addresses both limitations. It estimates a **Hazard Ratio (HR)** for each variable, i.e. a number that quantifies the effect on the risk of death.
+
+The analysis proceeds in two steps. First, each variable is tested individually (**univariate analysis**) to quantify its crude effect on survival. Then, all variables are included in a single model (**multivariate analysis**) to estimate the independent effect of each, after adjustment for the others.
+
+## Univariate analyses
+
+Each variable is tested individually. The Hazard Ratio (HR) quantifies the crude association between each variable and survival, without adjustment.
+
+```{r cox-univar-code}
+cox_age <- coxph(Surv(time, status_bin) ~ age, data = lung)
+cox_sex <- coxph(Surv(time, status_bin) ~ sex_label, data = lung)
+cox_ecog <- coxph(Surv(time, status_bin) ~ ecog_label, data = lung)
+cox_wt <- coxph(Surv(time, status_bin) ~ wt.loss, data = lung)
+
+tbl3 <- tbl_stack(
+  tbls = list(
+    tbl_regression(cox_age, exponentiate = TRUE, label = list(age ~ "Age (per year)")) %>% bold_p(),
+    tbl_regression(cox_sex, exponentiate = TRUE, label = list(sex_label ~ "Sex (ref. Male)")) %>% bold_p(),
+    tbl_regression(cox_ecog, exponentiate = TRUE, label = list(ecog_label ~ "ECOG score (ref. 0)")) %>% bold_p(),
+    tbl_regression(cox_wt, exponentiate = TRUE, label = list(wt.loss ~ "Weight loss (lbs)")) %>% bold_p()
+  )
+) %>%
+  bold_labels() %>%
+  modify_header(label ~ "**Variable**")
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Table 3. Univariate Cox analyses — Hazard Ratios
+</div>
+
+```{r cox-univar-display, echo=FALSE}
+tbl3
+```
+
+**Reading the table:** an HR > 1 indicates an increased risk of death, an HR < 1 a protective effect. For example, the HR of 0.59 for females means that at any given time point, females have 41% less risk of death than males. The HR of 2.50 for ECOG 2 means these patients have 2.5 times the risk of dying compared to ECOG 0 patients. Weight loss (HR = 1.00, p = 0.925) is not significantly associated with survival in univariate analysis.
+
+These results confirm and quantify the visual observations from the Kaplan-Meier curves: ECOG score and sex are the factors most strongly associated with survival. Age appears to have only a marginal effect (HR = 1.02 per year, p = 0.040).
+
+## Multivariate analysis
+
+All variables are now included in a single model to estimate the **independent** effect of each, after adjustment for the others.
+
+```{r cox-multi-code}
+cox_multi <- coxph(
+  Surv(time, status_bin) ~ age + sex_label + ecog_label + wt.loss,
+  data = lung
+)
+
+tbl4 <- tbl_regression(
+  cox_multi,
+  exponentiate = TRUE,
+  label = list(
+    age        ~ "Age (per year)",
+    sex_label  ~ "Sex (ref. Male)",
+    ecog_label ~ "ECOG score (ref. 0)",
+    wt.loss    ~ "Weight loss (lbs)"
+  )
+) %>%
+  bold_p() %>%
+  bold_labels() %>%
+  modify_header(label ~ "**Variable**")
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Table 4. Multivariate Cox model — Adjusted Hazard Ratios
+</div>
+
+```{r cox-multi-display, echo=FALSE}
+tbl4
+```
+
+**Reading the table:** after mutual adjustment, **sex** and **ECOG score** remain independent and significant predictors of survival. The adjusted HR for females (0.56) is even slightly stronger than in univariate analysis (0.59), suggesting that the protective effect of female sex was not due to confounding with other variables. In contrast, **age** (HR = 1.01, p = 0.20) and **weight loss** (HR = 0.99, p = 0.20) are no longer significant after adjustment. The apparent effect of age in univariate analysis was probably confounded by ECOG score.
+
+## Forest plot
+
+The forest plot is a visual representation of the adjusted Hazard Ratios from the multivariate model. It allows for a quick comparison of the magnitude and direction of each variable's effect.
+
+```{r forest-plot-code, fig.height=5, fig.width=9}
+cox_tidy <- tidy(cox_multi, exponentiate = TRUE, conf.int = TRUE) %>%
+  mutate(
+    label = case_when(
+      term == "age"                                      ~ "Age (per year)",
+      term == "sex_labelFemale"                          ~ "Sex: Female (ref. Male)",
+      term == "ecog_labelECOG 1 — Sympt. ambulatory"    ~ "ECOG 1 (ref. ECOG 0)",
+      term == "ecog_labelECOG 2 — In bed <50%"          ~ "ECOG 2 (ref. ECOG 0)",
+      term == "ecog_labelECOG 3 — In bed >50%"          ~ "ECOG 3 (ref. ECOG 0)",
+      term == "wt.loss"                                  ~ "Weight loss (lbs)",
+      TRUE ~ term
+    ),
+    signif = ifelse(p.value < 0.05, "Significant", "Not significant")
+  )
+
+p_forest <- ggplot(cox_tidy, aes(x = estimate, y = reorder(label, estimate))) +
+  geom_point(aes(color = signif), size = 3) +
+  geom_errorbarh(
+    aes(xmin = conf.low, xmax = conf.high, color = signif),
+    height = 0.2
+  ) +
+  geom_vline(xintercept = 1, linetype = "dashed", color = "grey40") +
+  scale_color_manual(
+    values = c("Significant" = "#D9534F", "Not significant" = "#999999"),
+    name = ""
+  ) +
+  scale_x_log10() +
+  labs(
+    x = "Hazard Ratio (95% CI), logarithmic scale",
+    y = ""
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position = "bottom"
+  )
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Figure 5. Forest plot — Adjusted Hazard Ratios from the multivariate Cox model (n = `r cox_multi$n`)
+</div>
+
+```{r forest-plot-display, echo=FALSE, fig.height=5, fig.width=9}
+p_forest
+```
+
+**Reading the figure:** each point represents the adjusted hazard ratio of a variable, and the horizontal bars their 95% confidence interval. The dashed vertical line at HR = 1 represents the absence of effect. When a confidence interval crosses this line, the effect is not significant (grey). When it does not, the effect is significant (red). When the confidence interval lies to the left of the HR = 1 line (without crossing it), the variable has a significant protective effect compared to the reference category. Conversely, when the confidence interval lies to the right (without crossing it), the variable increases the risk of death compared to the reference.
+
+ECOG score (especially ECOG 2 and ECOG 3) clearly has the strongest effect on mortality, with HRs far to the right of 1 (increased risk). Female sex, conversely, is the only significant protective factor, with an HR clearly to the left of 1. Age and weight loss, whose confidence intervals overlap the line at 1, are not significant in this model.
+
+# Proportional hazards test (Schoenfeld)
+
+The Cox model rests on the assumption that Hazard Ratios between two groups are **constant over time**. This is called the **proportional hazards assumption**. Concretely, if females have an HR of 0.56 compared to males, the model assumes that this 44% advantage is the same at day 100 as at day 500 or day 900. The hazard curves of the two groups remain "parallel": they do not cross and the gap between them does not change over time.
+If this assumption is violated (for example, if a treatment is strongly protective in the first months but then loses its effect), the single HR estimated by the Cox model no longer correctly reflects reality, and the results become difficult to interpret.
+
+This assumption is verified using the **Schoenfeld test**. This test examines, for each variable in the model, whether the residuals (the gaps between what the model predicts and what is observed) vary systematically with time. If residuals are randomly dispersed around zero (no visible trend), the assumption holds. If a trend is observed (upward or downward slope), the variable's effect changes over time and the assumption is violated.
+The test produces a p-value for each variable individually and a global test for the entire model. If the p-value is above 0.05, no violation of the assumption is detected and the Cox model is considered valid.
+
+```{r schoenfeld-code}
+ph_test <- cox.zph(cox_multi)
+ph_test
+```
+
+```{r schoenfeld-plot-code}
+p_schoenfeld <- ggcoxzph(ph_test, font.main = c(11, "plain", "black"))
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.15em; margin-bottom: 8px;">
+Figure 6. Schoenfeld residuals
+</div>
+
+```{r schoenfeld-plot-display, echo=FALSE, fig.height=8, fig.width=10}
+gridExtra::grid.arrange(
+  p_schoenfeld[[1]], p_schoenfeld[[2]],
+  p_schoenfeld[[3]], p_schoenfeld[[4]],
+  ncol = 2
+)
+```
+
+<div style="text-align: center; font-weight: bold; font-size: 1.3em; margin-top: 12px; margin-bottom: 12px;">
+Global Schoenfeld Test p = `r round(ph_test$table["GLOBAL", "p"], 4)`
+</div>
+
+The global test is **`r ifelse(ph_test$table["GLOBAL", "p"] > 0.05, "non-significant", "significant")`** (p = `r round(ph_test$table["GLOBAL", "p"], 3)`), meaning that the proportional hazards assumption is **`r ifelse(ph_test$table["GLOBAL", "p"] > 0.05, "satisfied", "violated")`**. The Cox model is therefore `r ifelse(ph_test$table["GLOBAL", "p"] > 0.05, "valid", "to be reconsidered")`.
+
+# Summary
+
+```{r synthese, echo=FALSE}
+median_surv <- summary(km_global)$table["median"]
+```
+
+| Result | Detail |
+|:-------|:-------|
+| **Overall median survival** | `r median_surv` days |
+| **Effect of sex** | Females: significantly better survival |
+| **Effect of ECOG score** | Prognostic factor with the strongest effect on mortality |
+| **Multivariate Cox model** | Sex and ECOG = significant independent predictors |
+| **Proportional hazards** | `r ifelse(ph_test$table["GLOBAL", "p"] > 0.05, "Assumption satisfied", "Assumption not satisfied")` (p = `r round(ph_test$table["GLOBAL", "p"], 3)`) |
+
+# Limitations and perspectives
+
+## Limitations
+
+This analysis has several limitations:
+
+- **Limited sample size:** with 227 patients and only 1 ECOG 3 patient, estimates for this subgroup are unstable (very wide 95% CI: 1.22–67.9). Results for ECOG 3 should therefore be interpreted with caution.
+- **Missing clinical variables:** the dataset does not contain information on histological tumour type, TNM stage, or treatments received (chemotherapy, radiotherapy, surgery). Other clinically relevant variables are probably also missing. These factors are critical in pulmonary oncology and their absence limits the clinical significance of our conclusions. This illustrates the importance of close collaboration between clinicians and biostatisticians from the study design stage, to ensure that collected variables cover the relevant prognostic factors.
+- **Data age:** the data date from the late 1980s. Therapeutic practices have evolved considerably since then (immunotherapy, targeted therapies), making the results difficult to generalise to current patients.
+- **Missing data:** weight loss has 14 missing values (6% of observations). The multivariate Cox model automatically excludes these observations (complete case analysis), reducing the effective sample to 213 patients.
+
+## Perspectives
+
+Several methodological extensions could enrich this analysis:
+
+- **Subgroup analysis:** stratify the Cox model by sex or ECOG to explore potential interactions between prognostic factors.
+- **Missing data management:** use multiple imputation (`mice` package in R) rather than complete case exclusion, to reduce potential bias related to missing data.
+- **Competing risks:** in the context of advanced cancer, patients may die from causes unrelated to cancer. A competing risks analysis (Fine & Gray model) would distinguish cancer-specific mortality from all-cause mortality.
+- **External validation:** reproduce the analysis on a more recent and complete dataset to assess the robustness of the results.
+
+# References
+
+- Kassambara A, Kosinski M, Biecek P. survminer: Drawing Survival Curves using 'ggplot2'. R package.
+- Loprinzi CL, Laurie JA, Wieand HS, et al. Prospective evaluation of prognostic variables from patient-completed questionnaires. *Journal of Clinical Oncology*. 1994;12(3):601-607.
+- Oken MM, Creech RH, Tormey DC, et al. Toxicity and response criteria of the Eastern Cooperative Oncology Group. Am J Clin Oncol. 1982;5(6):649-655.
+- Therneau TM, Grambsch PM. *Modeling Survival Data: Extending the Cox Model*. Springer, 2000.
+
+
+---
+
+*Project built in R `r getRversion()` — Source code available on [GitHub](https://github.com/kfoubert/survival-analysis-oncology)*
